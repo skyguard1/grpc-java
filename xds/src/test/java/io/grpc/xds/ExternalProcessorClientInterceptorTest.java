@@ -8460,22 +8460,43 @@ public class ExternalProcessorClientInterceptorTest {
         filterConfig, channelManager, scheduler, FAKE_CONTEXT);
 
     final CountDownLatch dataPlaneLatch = new CountDownLatch(1);
-    dataPlaneServiceRegistry.addService(ServerServiceDefinition.builder("test.TestService")
-        .addMethod(METHOD_SAY_HELLO, ServerCalls.asyncUnaryCall(
-            (request, responseObserver) -> {
-              responseObserver.onNext("Hello " + request);
-              responseObserver.onCompleted();
-              dataPlaneLatch.countDown();
-            }))
-        .build());
+    final CountDownLatch headersReceivedLatch = new CountDownLatch(1);
+    final CountDownLatch resumeAsyncThreadLatch = new CountDownLatch(1);
+
+    ServerInterceptor dataPlaneInterceptor = new ServerInterceptor() {
+      @Override
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        headersReceivedLatch.countDown();
+        try {
+          resumeAsyncThreadLatch.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        return next.startCall(call, headers);
+      }
+    };
+
+    dataPlaneServiceRegistry.addService(ServerInterceptors.intercept(
+        ServerServiceDefinition.builder("test.TestService")
+            .addMethod(METHOD_SAY_HELLO, ServerCalls.asyncUnaryCall(
+                (request, responseObserver) -> {
+                  responseObserver.onNext("Hello " + request);
+                  responseObserver.onCompleted();
+                  dataPlaneLatch.countDown();
+                }))
+            .build(),
+        dataPlaneInterceptor));
 
     ManagedChannel dataPlaneChannel = grpcCleanup.register(
         InProcessChannelBuilder.forName(dataPlaneServerName).directExecutor().build());
 
+    final AtomicReference<Status> statusRef = new AtomicReference<>();
     final CountDownLatch closedLatch = new CountDownLatch(1);
     ClientCall.Listener<String> appListener = new ClientCall.Listener<String>() {
       @Override
       public void onClose(Status status, Metadata trailers) {
+        statusRef.set(status);
         closedLatch.countDown();
       }
     };
@@ -8485,15 +8506,27 @@ public class ExternalProcessorClientInterceptorTest {
         interceptCall(interceptor, METHOD_SAY_HELLO, callOptions, dataPlaneChannel);
     proxyCall.start(appListener, new Metadata());
 
-    // Send message and half-close to trigger unary call reaching server
+    // Trigger unary call. request(1) starts it.
     proxyCall.request(1);
+
+    // Wait for the async sidecar thread to enter activateCall() and block inside interceptCall
+    assertThat(headersReceivedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // Now, while the async thread is blocked (and passThroughMode is still false),
+    // send a message and half-close.
     proxyCall.sendMessage("test");
     proxyCall.halfClose();
 
+    // Unblock the async thread
+    resumeAsyncThreadLatch.countDown();
+
     // Verify data plane call reached (failed open)
     assertThat(dataPlaneLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // Verify client call completes successfully
+    assertThat(closedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(statusRef.get().isOk()).isTrue();
     
-    proxyCall.cancel("Cleanup", null);
     channelManager.close();
   }
 
